@@ -7,7 +7,7 @@ import json
 import pickle
 import re
 from collections import Counter, defaultdict
-from typing import Dict, List, Tuple, Set, Optional
+from typing import Dict, List, Tuple, Set, Optional, Union, Any
 
 
 class CustomBPETokenizer:
@@ -327,35 +327,96 @@ class CustomBPETokenizer:
         print(f"토크나이저 로드 완료: {file_path}")
         return tokenizer
     
-    def __call__(self, text: str, max_length: int = None, truncation: bool = False, 
-                 padding: bool = False, return_tensors: str = None, add_special_tokens: bool = True):
+    def __call__(
+        self,
+        text: Union[str, List[str]],
+        max_length: Optional[int] = None,
+        truncation: bool = False,
+        padding: Union[bool, str] = False,
+        return_tensors: Optional[str] = None,
+        add_special_tokens: bool = True,
+    ) -> Dict[str, Any]:
         """
-        transformers 스타일의 호출 인터페이스
+        transformers / SentenceTransformer 스타일의 호출 인터페이스
         작성자: theprismdata@gmail.com
         
         Args:
-            text: 인코딩할 텍스트
-            max_length: 최대 길이
-            truncation: 트렁케이션 여부
-            padding: 패딩 여부
-            return_tensors: 반환 텐서 타입
+            text: 인코딩할 텍스트 (문자열 또는 문자열 리스트)
+            max_length: 최대 길이 (truncation / padding 시 사용)
+            truncation: max_length를 초과하는 토큰을 잘라낼지 여부
+            padding: 패딩 여부 (True, False, 'max_length' 지원)
+            return_tensors: 'pt'로 설정 시 PyTorch 텐서 반환
             add_special_tokens: 특수 토큰 추가 여부
             
         Returns:
-            인코딩 결과 딕셔너리
+            {
+                'input_ids': List[List[int]] 또는 torch.LongTensor,
+                'attention_mask': List[List[int]] 또는 torch.LongTensor
+            }
         """
-        token_ids = self.encode(text, add_special_tokens=add_special_tokens)
-        
-        # 트렁케이션
-        if truncation and max_length and len(token_ids) > max_length:
-            token_ids = token_ids[:max_length]
-        
-        # 패딩
-        if padding and max_length:
-            if len(token_ids) < max_length:
-                token_ids = token_ids + [self.pad_token_id] * (max_length - len(token_ids))
-        
-        return {'input_ids': token_ids}
+        # 단일 문장 / 배치 모두 지원
+        is_single_input = isinstance(text, str)
+        texts: List[str] = [text] if is_single_input else list(text)
+
+        # 각 문장 인코딩
+        all_token_ids: List[List[int]] = [
+            self.encode(t, add_special_tokens=add_special_tokens) for t in texts
+        ]
+
+        # 트렁케이션 적용
+        if truncation and max_length is not None:
+            truncated_token_ids: List[List[int]] = []
+            for ids in all_token_ids:
+                if len(ids) > max_length:
+                    truncated_token_ids.append(ids[:max_length])
+                else:
+                    truncated_token_ids.append(ids)
+            all_token_ids = truncated_token_ids
+
+        # 패딩 길이 결정
+        if padding:
+            if isinstance(padding, str) and padding == "max_length" and max_length is not None:
+                target_len = max_length
+            else:
+                # 배치 내 최장 길이 또는 max_length 중 큰 값 사용
+                max_batch_len = max(len(ids) for ids in all_token_ids) if all_token_ids else 0
+                target_len = max_batch_len if max_length is None else max(max_batch_len, max_length)
+
+            padded_ids: List[List[int]] = []
+            attention_mask: List[List[int]] = []
+
+            for ids in all_token_ids:
+                # 필요 시 잘라내기
+                if len(ids) > target_len:
+                    ids = ids[:target_len]
+
+                pad_len = target_len - len(ids)
+                padded = ids + [self.pad_token_id] * pad_len
+                mask = [1] * len(ids) + [0] * pad_len
+
+                padded_ids.append(padded)
+                attention_mask.append(mask)
+        else:
+            padded_ids = all_token_ids
+            attention_mask = [[1] * len(ids) for ids in all_token_ids]
+
+        # 텐서 변환 (SentenceTransformer 호환)
+        if return_tensors == "pt":
+            import torch
+
+            input_ids_tensor = torch.tensor(padded_ids, dtype=torch.long)
+            attention_mask_tensor = torch.tensor(attention_mask, dtype=torch.long)
+
+            return {
+                "input_ids": input_ids_tensor,
+                "attention_mask": attention_mask_tensor,
+            }
+
+        # 파이썬 리스트 형태 반환 (HF/SentenceTransformer 기본 동작과 유사)
+        return {
+            "input_ids": padded_ids,
+            "attention_mask": attention_mask,
+        }
 
 
 def train_custom_tokenizer_from_json(json_file: str, vocab_size: int = 10000, 

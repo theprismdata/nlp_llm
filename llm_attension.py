@@ -12,7 +12,7 @@ import numpy as np
 import sys
 import io
 from typing import List, Dict, Tuple, Optional
-from transformers import AutoTokenizer
+from custom_tokenizer import CustomBPETokenizer
 
 
 def load_json_data(file_path: str) -> List[Dict]:
@@ -31,24 +31,24 @@ def load_json_data(file_path: str) -> List[Dict]:
     return data.get('data_info', [])
 
 
-def load_tokenizer() -> AutoTokenizer:
+def load_tokenizer() -> CustomBPETokenizer:
     """
-    Qwen2.5 토크나이저를 로드합니다.
+    로컬 커스텀 BPE 토크나이저를 로드합니다.
     작성자: theprismdata@gmail.com
         
     Returns:
-        Qwen2.5 토크나이저 객체
+        커스텀 BPE 토크나이저 객체
     """
-    model_name = "Qwen/Qwen2.5-0.5B"
+    tokenizer_path = "custom_tokenizer.pkl"
     try:
-        tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True)
-        print(f"Qwen2.5 토크나이저 로드 완료: {model_name}")
+        tokenizer = CustomBPETokenizer.load(tokenizer_path)
+        print(f"커스텀 토크나이저 로드 완료: {tokenizer_path}")
         return tokenizer
     except Exception as e:
-        raise Exception(f"Qwen2.5 토크나이저를 로드할 수 없습니다: {e}\ntransformers 라이브러리가 설치되어 있는지 확인하세요.")
+        raise Exception(f"커스텀 토크나이저를 로드할 수 없습니다: {e}\n{tokenizer_path} 파일이 존재하는지 확인하세요.")
 
 
-def tokenize_text(text: str, tokenizer: AutoTokenizer, max_length: int = 512) -> List[int]:
+def tokenize_text(text: str, tokenizer: CustomBPETokenizer, max_length: int = 512) -> List[int]:
     """
     텍스트를 토크나이저를 사용하여 토큰화합니다.
     작성자: theprismdata@gmail.com
@@ -61,15 +61,14 @@ def tokenize_text(text: str, tokenizer: AutoTokenizer, max_length: int = 512) ->
     Returns:
         토큰 ID 리스트
     """
-    # 토크나이저로 인코딩
-    encoded = tokenizer(
-        text,
-        max_length=max_length,
-        truncation=True,
-        padding=False,
-        return_tensors=None
-    )
-    return encoded['input_ids']
+    # 커스텀 토크나이저로 인코딩
+    token_ids = tokenizer.encode(text, add_special_tokens=True)
+    
+    # 최대 길이로 트렁케이션
+    if len(token_ids) > max_length:
+        token_ids = token_ids[:max_length]
+    
+    return token_ids
 
 
 def create_embeddings(vocab_size: int, d_model: int) -> nn.Embedding:
@@ -85,6 +84,58 @@ def create_embeddings(vocab_size: int, d_model: int) -> nn.Embedding:
         임베딩 레이어
     """
     return nn.Embedding(vocab_size, d_model)
+
+
+class CustomTokenizerEmbeddingModel(nn.Module):
+    """
+    CustomBPETokenizer로부터 임베딩을 생성하는 단순 모델
+    작성자: theprismdata@gmail.com
+    """
+    
+    def __init__(self, vocab_size: int, d_model: int = 3072):
+        """
+        Custom 토크나이저 임베딩 모델 초기화
+        작성자: theprismdata@gmail.com
+        
+        Args:
+            vocab_size: 어휘 크기
+            d_model: 임베딩 차원
+        """
+        super(CustomTokenizerEmbeddingModel, self).__init__()
+        self.vocab_size = vocab_size
+        self.d_model = d_model
+        self.embedding = nn.Embedding(vocab_size, d_model)
+    
+    def forward(self, input_ids: torch.Tensor, attention_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
+        """
+        입력 토큰 ID로부터 문장 임베딩을 계산합니다.
+        작성자: theprismdata@gmail.com
+        
+        Args:
+            input_ids: 토큰 ID 텐서 (batch_size, seq_len)
+            attention_mask: 어텐션 마스크 (batch_size, seq_len) – 1은 유효 토큰, 0은 패딩
+            
+        Returns:
+            문장 임베딩 텐서 (batch_size, d_model)
+        """
+        # 토큰 ID가 어휘 범위를 벗어나지 않도록 클램핑
+        input_ids = torch.clamp(input_ids, 0, self.vocab_size - 1)
+        
+        # 토큰 임베딩 계산
+        token_embeds = self.embedding(input_ids)  # (batch_size, seq_len, d_model)
+        
+        # 마스크 기반 mean pooling
+        if attention_mask is not None:
+            mask = attention_mask.unsqueeze(-1).float()  # (batch_size, seq_len, 1)
+            token_embeds = token_embeds * mask
+            summed = token_embeds.sum(dim=1)  # (batch_size, d_model)
+            denom = mask.sum(dim=1).clamp(min=1e-6)  # (batch_size, 1)
+            sentence_embeds = summed / denom
+        else:
+            # 마스크가 없으면 단순 평균
+            sentence_embeds = token_embeds.mean(dim=1)
+        
+        return sentence_embeds
 
 
 class TransformerModel(nn.Module):
@@ -244,7 +295,7 @@ class SelfAttention(nn.Module):
         return output, attention_weights
 
 
-def process_text_data(data_info: List[Dict], tokenizer: AutoTokenizer, max_length: int = 512) -> Tuple[torch.Tensor, int, List[List[int]]]:
+def process_text_data(data_info: List[Dict], tokenizer: CustomBPETokenizer, max_length: int = 512) -> Tuple[torch.Tensor, int, List[List[int]]]:
     """
     텍스트 데이터를 처리하여 토큰 ID 텐서로 변환합니다.
     작성자: theprismdata@gmail.com
@@ -268,13 +319,11 @@ def process_text_data(data_info: List[Dict], tokenizer: AutoTokenizer, max_lengt
             original_token_ids.append(token_ids.copy())
             all_token_ids.append(token_ids)
     
-    # 패딩 토큰 ID 가져오기
-    pad_token_id = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else tokenizer.eos_token_id
-    if pad_token_id is None:
-        pad_token_id = 0
+    # 패딩 토큰 ID 가져오기 (커스텀 토크나이저)
+    pad_token_id = tokenizer.pad_token_id
     
     # 어휘 크기 가져오기
-    vocab_size = tokenizer.vocab_size
+    vocab_size = len(tokenizer.vocab)
     
     # 시퀀스 길이를 max_length로 맞추기 (패딩 또는 트렁케이션)
     processed_token_ids = []
@@ -285,9 +334,8 @@ def process_text_data(data_info: List[Dict], tokenizer: AutoTokenizer, max_lengt
         if len(token_ids) > max_length:
             token_ids = token_ids[:max_length]
         elif len(token_ids) < max_length:
-            # 패딩 추가 (패딩 토큰도 vocab_size 내로)
-            pad_id = min(pad_token_id, vocab_size - 1)
-            token_ids = token_ids + [pad_id] * (max_length - len(token_ids))
+            # 패딩 추가
+            token_ids = token_ids + [pad_token_id] * (max_length - len(token_ids))
         processed_token_ids.append(token_ids)
     
     # 텐서로 변환
@@ -296,7 +344,52 @@ def process_text_data(data_info: List[Dict], tokenizer: AutoTokenizer, max_lengt
     return token_tensor, vocab_size, original_token_ids
 
 
-def tokens_to_text(token_ids: List[int], tokenizer: AutoTokenizer) -> List[str]:
+def get_embeddings_with_custom_tokenizer(
+    texts: List[str],
+    tokenizer: CustomBPETokenizer,
+    d_model: int = 3072,
+    max_length: int = 256,
+    device: str = 'cpu'
+) -> torch.Tensor:
+    """
+    CustomBPETokenizer를 사용하여 문장 임베딩을 생성합니다.
+    작성자: theprismdata@gmail.com
+    
+    Args:
+        texts: 임베딩을 만들 텍스트 리스트
+        tokenizer: CustomBPETokenizer 객체
+        d_model: 임베딩 차원 (기본 3072)
+        max_length: 최대 시퀀스 길이
+        device: 사용할 디바이스 ('cpu' 또는 'cuda')
+        
+    Returns:
+        문장 임베딩 텐서 (batch_size, d_model)
+    """
+    # 토크나이저로 배치 인코딩 (SentenceTransformer 스타일)
+    encoding = tokenizer(
+        texts,
+        max_length=max_length,
+        truncation=True,
+        padding=True,
+        return_tensors="pt",
+        add_special_tokens=True,
+    )
+    
+    input_ids = encoding["input_ids"].to(device)
+    attention_mask = encoding["attention_mask"].to(device)
+    
+    # 임베딩 모델 생성
+    vocab_size = len(tokenizer.vocab)
+    embedding_model = CustomTokenizerEmbeddingModel(vocab_size=vocab_size, d_model=d_model).to(device)
+    
+    embedding_model.eval()
+    with torch.no_grad():
+        embeddings = embedding_model(input_ids, attention_mask=attention_mask)
+    
+    return embeddings
+
+
+def tokens_to_text(token_ids: List[int], tokenizer: CustomBPETokenizer) -> List[str]:
     """
     토큰 ID 리스트를 텍스트로 변환합니다.
     작성자: theprismdata@gmail.com
@@ -308,30 +401,29 @@ def tokens_to_text(token_ids: List[int], tokenizer: AutoTokenizer) -> List[str]:
     Returns:
         토큰 텍스트 리스트 (한글 포함)
     """
-    # 각 토큰을 개별적으로 디코딩하여 한글이 제대로 표시되도록 함
+    # 커스텀 토크나이저로 각 토큰을 텍스트로 변환
     token_texts = []
     for tid in token_ids:
         try:
-            # 토큰을 텍스트로 변환
-            token_text = tokenizer.decode([tid], skip_special_tokens=False)
+            # 토큰 ID를 토큰 문자열로 변환
+            token_text = tokenizer.inverse_vocab.get(tid, '<UNK>')
+            
             # 특수 토큰 처리
-            if token_text.strip() == "" or len(token_text) == 0:
-                token_text = tokenizer.convert_ids_to_tokens([tid])[0]
-                # 서브워드 토큰의 특수 문자 제거
-                if token_text.startswith('##') or token_text.startswith('▁'):
-                    token_text = token_text.lstrip('##').lstrip('▁')
-            # 공백 문자 정리
-            token_text = token_text.replace(' ', '').replace('\n', '').replace('\t', '')
-            if not token_text:
-                token_text = f"[{tid}]"
-            token_texts.append(token_text)
+            if token_text in tokenizer.special_tokens:
+                token_texts.append(token_text)
+            else:
+                # 단어 끝 마커 제거하여 표시
+                token_text = token_text.replace('</w>', '')
+                if not token_text:
+                    token_text = f"[{tid}]"
+                token_texts.append(token_text)
         except Exception as e:
-            # 디코딩 실패 시 토큰 ID 표시
+            # 변환 실패 시 토큰 ID 표시
             token_texts.append(f"[{tid}]")
     return token_texts
 
 
-def get_original_text_tokens(data_info: List[Dict], tokenizer: AutoTokenizer, batch_idx: int = 0, max_length: int = 256) -> Tuple[List[str], List[int]]:
+def get_original_text_tokens(data_info: List[Dict], tokenizer: CustomBPETokenizer, batch_idx: int = 0, max_length: int = 256) -> Tuple[List[str], List[int]]:
     """
     원본 텍스트를 단어 단위로 분리하여 반환합니다.
     작성자: theprismdata@gmail.com
@@ -374,7 +466,7 @@ def get_original_text_tokens(data_info: List[Dict], tokenizer: AutoTokenizer, ba
 def analyze_word_relationships(
     attention_weights: torch.Tensor,
     token_ids: torch.Tensor,
-    tokenizer: AutoTokenizer,
+    tokenizer: CustomBPETokenizer,
     data_info: List[Dict] = None,
     batch_idx: int = 0,
     head_idx: int = 0,
@@ -397,7 +489,7 @@ def analyze_word_relationships(
         max_tokens: 분석할 최대 토큰 수
     """
     # 패딩 토큰 ID 가져오기
-    pad_token_id = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else tokenizer.eos_token_id
+    pad_token_id = tokenizer.pad_token_id
     
     # 특정 배치와 헤드의 attention weights 추출
     attn = attention_weights[batch_idx, head_idx].detach().cpu()  # (seq_len, seq_len)
@@ -565,7 +657,7 @@ def analyze_word_relationships(
 def train_model(
     model: nn.Module,
     train_data: torch.Tensor,
-    tokenizer: AutoTokenizer,
+    tokenizer: CustomBPETokenizer,
     num_epochs: int = 5,
     batch_size: int = 8,
     learning_rate: float = 0.001,
@@ -589,7 +681,7 @@ def train_model(
     
     # 옵티마이저와 손실 함수 설정
     optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate)
-    criterion = nn.CrossEntropyLoss(ignore_index=tokenizer.pad_token_id if tokenizer.pad_token_id is not None else -100)
+    criterion = nn.CrossEntropyLoss(ignore_index=tokenizer.pad_token_id)
     
     num_samples = train_data.shape[0]
     num_batches = (num_samples + batch_size - 1) // batch_size
@@ -656,14 +748,13 @@ def main():
     """
     메인 실행 함수
     작성자: theprismdata@gmail.com
+    
+    Args:
+        없음
     """
     # 디바이스 설정
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
     print(f"사용 디바이스: {device}")
-    
-    # Qwen2.5 토크나이저 로드
-    print("\nQwen2.5 토크나이저 로드 중...")
-    tokenizer = load_tokenizer()
     
     # JSON 파일 로드
     json_file_path = 'SL01-00-00.json'
@@ -671,11 +762,34 @@ def main():
     data_info = load_json_data(json_file_path)
     print(f"로드된 데이터 항목 수: {len(data_info)}")
     
+    # ===== 커스텀 토크나이저 + 학습형 임베딩 / 임베딩 생성 =====
+    print("\n" + "="*80)
+    print("커스텀 토크나이저 + 학습형 임베딩 모드")
+    print("="*80)
+    
+    # 커스텀 토크나이저 로드
+    print("\n커스텀 BPE 토크나이저 로드 중...")
+    tokenizer = load_tokenizer()
+    
     # 텍스트 데이터 처리
     print("\n텍스트 데이터 처리 중...")
     token_tensor, vocab_size, original_token_ids = process_text_data(data_info, tokenizer, max_length=256)
     print(f"어휘 크기: {vocab_size}")
     print(f"토큰 텐서 shape: {token_tensor.shape}")
+    
+    # 커스텀 토크나이저 기반 문장 임베딩 생성 예시
+    sample_texts = [item.get('contents', '') for item in data_info if item.get('contents', '')]
+    sample_texts = sample_texts[:4]
+    if sample_texts:
+        print("\n커스텀 토크나이저 기반 문장 임베딩 생성 테스트...")
+        embeddings = get_embeddings_with_custom_tokenizer(
+            texts=sample_texts,
+            tokenizer=tokenizer,
+            d_model=3072,
+            max_length=256,
+            device=device
+        )
+        print(f"생성된 문장 임베딩 텐서 shape: {embeddings.shape}")
     
     # 모델 파라미터 설정
     d_model = 128

@@ -28,6 +28,7 @@ class CustomBPETokenizer:
         self.vocab = {}  # token -> id
         self.inverse_vocab = {}  # id -> token
         self.merges = {}  # (pair) -> merged_token
+        self.merge_ranks = {}  # (pair) -> merge order (theprismdata@gmail.com)
         self.special_tokens = {
             '<PAD>': 0,
             '<UNK>': 1,
@@ -150,6 +151,8 @@ class CustomBPETokenizer:
             # 병합된 토큰을 어휘에 추가
             merged_token = ''.join(best_pair)
             self.merges[best_pair] = merged_token
+            # 병합 순서 기록 (인덱스 캐시로 토큰화 속도 향상)
+            self.merge_ranks[best_pair] = merge_count  # theprismdata@gmail.com
             self.vocab[merged_token] = current_vocab_size
             self.inverse_vocab[current_vocab_size] = merged_token
             current_vocab_size += 1
@@ -187,8 +190,11 @@ class CustomBPETokenizer:
             if not valid_pairs:
                 break
             
-            # 가장 먼저 병합된 쌍 선택 (학습 순서 기준)
-            best_pair = min(valid_pairs, key=lambda p: list(self.merges.keys()).index(p))
+            # 가장 먼저 병합된 쌍 선택 (학습 순서 기준, 사전 계산된 rank 사용)
+            best_pair = min(
+                valid_pairs,
+                key=lambda p: self.merge_ranks.get(p, float("inf"))  # theprismdata@gmail.com
+            )
             
             # 쌍 병합
             merged_token = self.merges[best_pair]
@@ -299,6 +305,7 @@ class CustomBPETokenizer:
             'inverse_vocab': self.inverse_vocab,
             'merges': self.merges,
             'special_tokens': self.special_tokens,
+            'merge_ranks': self.merge_ranks,
         }
         with open(file_path, 'wb') as f:
             pickle.dump(data, f)
@@ -324,6 +331,15 @@ class CustomBPETokenizer:
         tokenizer.inverse_vocab = data['inverse_vocab']
         tokenizer.merges = data['merges']
         tokenizer.special_tokens = data['special_tokens']
+
+        # merge_ranks가 저장되어 있으면 사용, 없으면 merges 순서로부터 재구성
+        if 'merge_ranks' in data:
+            tokenizer.merge_ranks = data['merge_ranks']
+        else:
+            # Python 3.7+에서 dict는 삽입 순서를 유지하므로, 키 순서로 rank 부여
+            tokenizer.merge_ranks = {
+                pair: idx for idx, pair in enumerate(tokenizer.merges.keys())
+            }  # theprismdata@gmail.com
         print(f"토크나이저 로드 완료: {file_path}")
         return tokenizer
     

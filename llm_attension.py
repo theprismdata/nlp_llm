@@ -12,7 +12,9 @@ import numpy as np
 import sys
 import io
 from typing import List, Dict, Tuple, Optional
+from torch.utils.tensorboard import SummaryWriter  # theprismdata@gmail.com
 from custom_tokenizer import CustomBPETokenizer
+from custom_embedding_model import CustomTokenizerEmbeddingModel  # theprismdata@gmail.com
 
 
 def load_json_data(file_path: str) -> List[Dict]:
@@ -84,58 +86,6 @@ def create_embeddings(vocab_size: int, d_model: int) -> nn.Embedding:
         임베딩 레이어
     """
     return nn.Embedding(vocab_size, d_model)
-
-
-class CustomTokenizerEmbeddingModel(nn.Module):
-    """
-    CustomBPETokenizer로부터 임베딩을 생성하는 단순 모델
-    작성자: theprismdata@gmail.com
-    """
-    
-    def __init__(self, vocab_size: int, d_model: int = 3072):
-        """
-        Custom 토크나이저 임베딩 모델 초기화
-        작성자: theprismdata@gmail.com
-        
-        Args:
-            vocab_size: 어휘 크기
-            d_model: 임베딩 차원
-        """
-        super(CustomTokenizerEmbeddingModel, self).__init__()
-        self.vocab_size = vocab_size
-        self.d_model = d_model
-        self.embedding = nn.Embedding(vocab_size, d_model)
-    
-    def forward(self, input_ids: torch.Tensor, attention_mask: Optional[torch.Tensor] = None) -> torch.Tensor:
-        """
-        입력 토큰 ID로부터 문장 임베딩을 계산합니다.
-        작성자: theprismdata@gmail.com
-        
-        Args:
-            input_ids: 토큰 ID 텐서 (batch_size, seq_len)
-            attention_mask: 어텐션 마스크 (batch_size, seq_len) – 1은 유효 토큰, 0은 패딩
-            
-        Returns:
-            문장 임베딩 텐서 (batch_size, d_model)
-        """
-        # 토큰 ID가 어휘 범위를 벗어나지 않도록 클램핑
-        input_ids = torch.clamp(input_ids, 0, self.vocab_size - 1)
-        
-        # 토큰 임베딩 계산
-        token_embeds = self.embedding(input_ids)  # (batch_size, seq_len, d_model)
-        
-        # 마스크 기반 mean pooling
-        if attention_mask is not None:
-            mask = attention_mask.unsqueeze(-1).float()  # (batch_size, seq_len, 1)
-            token_embeds = token_embeds * mask
-            summed = token_embeds.sum(dim=1)  # (batch_size, d_model)
-            denom = mask.sum(dim=1).clamp(min=1e-6)  # (batch_size, 1)
-            sentence_embeds = summed / denom
-        else:
-            # 마스크가 없으면 단순 평균
-            sentence_embeds = token_embeds.mean(dim=1)
-        
-        return sentence_embeds
 
 
 class TransformerModel(nn.Module):
@@ -661,7 +611,8 @@ def train_model(
     num_epochs: int = 5,
     batch_size: int = 8,
     learning_rate: float = 0.001,
-    device: str = 'cpu'
+    device: str = 'cpu',
+    log_dir: Optional[str] = None
 ):
     """
     모델을 학습시킵니다.
@@ -693,6 +644,10 @@ def train_model(
     print(f"  에폭 수: {num_epochs}")
     print(f"  학습률: {learning_rate}")
     print(f"  디바이스: {device}\n")
+
+    # TensorBoard SummaryWriter 설정 (실시간 차트용)
+    writer = SummaryWriter(log_dir=log_dir) if log_dir is not None else None  # theprismdata@gmail.com
+    global_step = 0
     
     for epoch in range(num_epochs):
         total_loss = 0.0
@@ -731,6 +686,11 @@ def train_model(
             optimizer.step()
             
             total_loss += loss.item()
+
+            # TensorBoard에 배치 손실 로깅
+            if writer is not None:
+                writer.add_scalar("train/batch_loss", loss.item(), global_step)
+            global_step += 1
             
             # 진행 상황 출력
             if (batch_idx + 1) % 10 == 0:
@@ -739,8 +699,16 @@ def train_model(
         
         avg_epoch_loss = total_loss / num_batches
         print(f"\nEpoch {epoch+1}/{num_epochs} 완료 - 평균 Loss: {avg_epoch_loss:.4f}\n")
+
+        # 에폭 단위 손실 로깅
+        if writer is not None:
+            writer.add_scalar("train/epoch_loss", avg_epoch_loss, epoch)
     
     print("학습 완료!")
+
+    if writer is not None:
+        writer.close()
+
     return model
 
 
@@ -798,7 +766,7 @@ def main():
     
     # 모델 생성
     print(f"\n모델 생성 중...")
-    model = TransformerModel(
+    transformer_model = TransformerModel(
         vocab_size=vocab_size,
         d_model=d_model,
         num_heads=num_heads,
@@ -807,8 +775,8 @@ def main():
     )
     
     # 모델 파라미터 수 출력
-    total_params = sum(p.numel() for p in model.parameters())
-    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    total_params = sum(p.numel() for p in transformer_model.parameters())
+    trainable_params = sum(p.numel() for p in transformer_model.parameters() if p.requires_grad)
     print(f"총 파라미터 수: {total_params:,}")
     print(f"학습 가능한 파라미터 수: {trainable_params:,}")
     
@@ -819,18 +787,19 @@ def main():
     train_data = token_tensor
     
     # 학습 실행
-    model = train_model(
-        model=model,
+    result_model = train_model(
+        model=transformer_model,
         train_data=train_data,
         tokenizer=tokenizer,
-        num_epochs=3,
+        num_epochs=10,
         batch_size=1,
         learning_rate=0.001,
-        device=device
+        device=device,
+        log_dir="runs/transformer_attention"  # TensorBoard 로그 디렉터리 (theprismdata@gmail.com)
     )
     
     # 학습 후 모델을 평가 모드로 전환
-    model.eval()
+    result_model.eval()
     
     # 추론 및 분석
     print("\n" + "="*80)
@@ -840,9 +809,9 @@ def main():
     batch_size = min(4, token_tensor.shape[0])
     input_tokens = token_tensor[:batch_size].to(device)
     
-    model.eval()
+    result_model.eval()
     with torch.no_grad():
-        logits, attention_weights_list = model(input_tokens)
+        logits, attention_weights_list = result_model(input_tokens)
         
         # 마지막 레이어의 attention weights 사용
         if attention_weights_list:
@@ -870,7 +839,7 @@ def main():
                 batch_idx=0,
                 head_idx=0,
                 top_k=5,
-                max_tokens=20
+                max_tokens=50
             )
             
             # 여러 헤드의 평균으로도 분석
@@ -889,7 +858,7 @@ def main():
                 batch_idx=0,
                 head_idx=0,
                 top_k=5,
-                max_tokens=20
+                max_tokens=50
             )
 
 
